@@ -14,11 +14,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-try:
-    import h5py  # type: ignore
-except ImportError:  # pragma: no cover
-    h5py = None
-
+import h5py  # type: ignore
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -171,7 +167,8 @@ def physics_model(
     if not isinstance(T, torch.Tensor):
         T = torch.tensor(T, dtype=torch.float32)
 
-    coef = torch.sigmoid(vds_coef_slope * Vds + vds_coef_intercept)
+    # Vds 有效系数改为温度的一次函数后取 sigmoid
+    coef = torch.sigmoid(vds_coef_slope * T + vds_coef_intercept)
     Vds_eff = Vds * coef
 
     T_safe = torch.clamp(T, min=CFG.min_temperature)
