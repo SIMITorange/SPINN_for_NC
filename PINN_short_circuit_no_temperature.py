@@ -135,8 +135,9 @@ class PINN(nn.Module):
         self.param8 = nn.Parameter(torch.tensor(5.0, dtype=torch.float32))
         self.param9 = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
 
-        # 热相关可学习参数
-        self.epi_thickness = nn.Parameter(torch.tensor(1.0e-5, dtype=torch.float32))
+        # 热相关参数（epi_thickness 固定为常数，不参与训练）
+        self.register_buffer("epi_thickness", torch.tensor(1.0e-5, dtype=torch.float32))
+        # self.epi_thickness = nn.Parameter(torch.tensor(1.0e-5, dtype=torch.float32))
         self.T_initial = nn.Parameter(torch.tensor(350.0, dtype=torch.float32))
 
         # 修改4：Vds 系数（一次函数经 sigmoid 约束到 0~1）
@@ -282,7 +283,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
     # 初始温度场（保持对 T_initial 的梯度）
     T_field = torch.ones((Nx, Ny, Nz), device=device, dtype=torch.float32) * model.T_initial
 
-    epi_thickness = torch.nn.functional.softplus(model.epi_thickness)
+    epi_thickness = model.epi_thickness
     h_z0 = CFG.h_z0
     h_zc = CFG.h_zc
     T_inf = CFG.T_inf
@@ -291,14 +292,15 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
     X, Y, Z = torch.meshgrid(x_mapped, y_mapped, z_mapped, indexing="ij")
     region_mask = ~((X > 0.8 * a) & (Y > 3.0 / 8.0 * b) & (Y < 5.0 / 8.0 * b))
 
-    prev_T_mean: Optional[torch.Tensor] = None
+    # 只反馈 z=0 表面的平均温度（该平面温度最高）
+    prev_T_surface: Optional[torch.Tensor] = None
     for i in range(len(time_raw)):
-        T_mean_prev = T_field.mean() if prev_T_mean is None else prev_T_mean
+        T_surface_prev = T_field[:, :, 0].mean() if prev_T_surface is None else prev_T_surface
 
         ids_prev = physics_model(
             vds_raw[i],
             vgs_raw[i],
-            T_mean_prev,
+            T_surface_prev,
             model.param1,
             model.param2,
             model.param3,
@@ -370,7 +372,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
 
                 T_field = T_new
 
-        T_mean = T_field.mean()
+        T_mean = T_field[:, :, 0].mean()
         ids_now = physics_model(
             vds_raw[i],
             vgs_raw[i],
@@ -390,7 +392,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
 
         t_mean_list.append(T_mean)
         physics_pred_list.append(ids_now)
-        prev_T_mean = T_mean
+        prev_T_surface = T_mean
 
         if torch.isnan(ids_now):
             print(f"!!! NaN detected at step {i} !!!")
@@ -465,7 +467,6 @@ def train_one_group(
                     model.param7,
                     model.param8,
                     model.param9,
-                    model.epi_thickness,
                     model.T_initial,
                     model.vds_coef_slope,
                     model.vds_coef_intercept,
@@ -655,7 +656,7 @@ def train_one_group(
         "param7": float(model.param7.detach().cpu().item()),
         "param8": float(model.param8.detach().cpu().item()),
         "param9": float(model.param9.detach().cpu().item()),
-        "epi_thickness": float(torch.nn.functional.softplus(model.epi_thickness).detach().cpu().item()),
+        "epi_thickness": float(model.epi_thickness.detach().cpu().item()),
         "T_initial": float(model.T_initial.detach().cpu().item()),
         "vds_coef_slope": float(model.vds_coef_slope.detach().cpu().item()),
         "vds_coef_intercept": float(model.vds_coef_intercept.detach().cpu().item()),
