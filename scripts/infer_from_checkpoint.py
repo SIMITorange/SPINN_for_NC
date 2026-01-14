@@ -2,7 +2,7 @@
 
 用法示例：
   python scripts/infer_from_checkpoint.py --checkpoint checkpoints/xxx.pt
-
+  python scripts/infer_from_checkpoint.py --all --checkpoint-dir checkpoints
 输出：
   inference/<ckpt_stem>/
     raw_time_ids_vds_vgs.txt
@@ -87,7 +87,8 @@ class PINN(torch.nn.Module):
         self.param8 = torch.nn.Parameter(torch.tensor(5.0, dtype=torch.float32))
         self.param9 = torch.nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
 
-        self.epi_thickness = torch.nn.Parameter(torch.tensor(1.0e-5, dtype=torch.float32))
+        # epi_thickness 固定常数，保持与训练脚本一致
+        self.register_buffer("epi_thickness", torch.tensor(1.0e-5, dtype=torch.float32))
         self.T_initial = torch.nn.Parameter(torch.tensor(350.0, dtype=torch.float32))
 
         self.vds_coef_slope = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
@@ -122,8 +123,10 @@ def physics_model(
     if not isinstance(T, torch.Tensor):
         T = torch.tensor(T, dtype=torch.float32)
 
-    coef = torch.sigmoid(vds_coef_slope * Vds + vds_coef_intercept)
-    Vds_eff = Vds * coef
+    coef = torch.sigmoid(vds_coef_slope * T + vds_coef_intercept)
+    # 与当前训练脚本保持一致，暂不缩放 Vds
+    # Vds_eff = Vds * coef
+    Vds_eff = Vds * 1
 
     T_safe = torch.clamp(T, min=min_temperature)
 
@@ -185,7 +188,7 @@ def _chebyshev_diff_matrix_torch(N: int, order: int, *, device: torch.device, dt
 
 
 def integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg: InferConfig):
-    """保持与训练脚本一致的返回：T_mean_seq, ids_physics_seq。"""
+    """保持与训练脚本一致的返回：每步芯片最高温度序列与物理电流。"""
     device = time_raw.device
     dtype = time_raw.dtype
 
@@ -215,17 +218,18 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg: InferConfig):
     delta_time = torch.zeros_like(time_raw)
     delta_time[1:] = time_raw[1:] - time_raw[:-1]
 
-    epi_thickness = torch.nn.functional.softplus(model.epi_thickness)
+    epi_thickness = model.epi_thickness
 
     X, Y, Z = torch.meshgrid(x_mapped, y_mapped, z_mapped, indexing="ij")
     region_mask = ~((X > 0.8 * a) & (Y > 3.0 / 8.0 * b) & (Y < 5.0 / 8.0 * b))
 
+    prev_T_max: torch.Tensor | None = None
     for i in range(len(time_raw)):
-        T_mean_prev = T_field.mean() if i == 0 else T_mean_seq[i - 1]
+        T_prev = T_field.max() if prev_T_max is None else prev_T_max
         ids_prev = physics_model(
             vds_raw[i],
             vgs_raw[i],
-            T_mean_prev,
+            T_prev,
             model.param1,
             model.param2,
             model.param3,
@@ -293,7 +297,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg: InferConfig):
 
                 T_field = T_new
 
-        T_mean = T_field.mean()
+        T_mean = T_field.max()
         T_mean_seq[i] = T_mean
         ids_physics[i] = physics_model(
             vds_raw[i],
@@ -312,6 +316,8 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg: InferConfig):
             model.vds_coef_intercept,
             min_temperature=cfg.min_temperature,
         )
+
+        prev_T_max = T_mean
 
     return T_mean_seq, ids_physics
 
@@ -337,18 +343,11 @@ def _load_group_from_hdf5(hdf5_path: str, group_name: str) -> Tuple[np.ndarray, 
     return data, labels
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True, help="训练保存的 checkpoint .pt")
-    ap.add_argument("--hdf5", default=None, help="combined_training_data.h5 路径（默认读取 checkpoint 中的 config）")
-    ap.add_argument("--group", default=None, help="HDF5 group name（默认读取 checkpoint 内保存的 group_name）")
-    ap.add_argument("--outdir", default="inference", help="输出目录")
-    args = ap.parse_args()
-
-    ckpt = torch.load(args.checkpoint, map_location="cpu")
+def _run_inference_for_checkpoint(ckpt_path: str, args) -> None:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     group_name = args.group or ckpt.get("group_name")
     if not group_name:
-        raise RuntimeError("无法确定 group_name：请通过 --group 指定")
+        raise RuntimeError(f"无法确定 group_name：请通过 --group 指定或在 checkpoint 中保存 group_name。({ckpt_path})")
 
     cfg_dict = ckpt.get("config", {})
     cfg = InferConfig(
@@ -370,13 +369,11 @@ def main() -> None:
 
     data_np, labels = _load_group_from_hdf5(hdf5_path, group_name)
 
-    # data: [time(s), Ids, Vds, Vgs]
     time_col = data_np[:, 0:1]
     ids_true = data_np[:, 1:2]
     vds_col = data_np[:, 2:3]
     vgs_col = data_np[:, 3:4]
 
-    # scalers from checkpoint
     in_mean = np.array(ckpt["input_scaler"]["mean"], dtype=np.float32)
     in_scale = np.array(ckpt["input_scaler"]["scale"], dtype=np.float32)
     tgt_mean = float(ckpt["target_scaler"]["mean"])
@@ -399,7 +396,7 @@ def main() -> None:
 
         T_mean, ids_physics = integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg)
 
-    ckpt_stem = os.path.splitext(os.path.basename(args.checkpoint))[0]
+    ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0]
     out_dir = os.path.join(args.outdir, _safe_filename(ckpt_stem))
     _ensure_dir(out_dir)
 
@@ -423,13 +420,40 @@ def main() -> None:
 
     meta = {
         **labels,
-        "checkpoint": args.checkpoint,
+        "checkpoint": ckpt_path,
         "hdf5": hdf5_path,
         "out_dir": out_dir,
     }
     print("Inference done:")
     for k, v in meta.items():
         print(f"  {k}: {v}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", help="单个 checkpoint .pt；若使用 --all 可忽略此项")
+    ap.add_argument("--checkpoint-dir", default="checkpoints", help="批量推理的目录，需包含 .pt 文件")
+    ap.add_argument("--all", action="store_true", help="对 checkpoint-dir 下所有 .pt 执行推理")
+    ap.add_argument("--hdf5", default=None, help="combined_training_data.h5 路径（默认读取 checkpoint 中的 config）")
+    ap.add_argument("--group", default=None, help="HDF5 group name（默认读取 checkpoint 内保存的 group_name）")
+    ap.add_argument("--outdir", default="inference", help="输出目录")
+    args = ap.parse_args()
+
+    if args.all:
+        if not os.path.isdir(args.checkpoint_dir):
+            raise RuntimeError(f"找不到 checkpoint 目录: {args.checkpoint_dir}")
+        ckpt_files = sorted(
+            [os.path.join(args.checkpoint_dir, f) for f in os.listdir(args.checkpoint_dir) if f.endswith('.pt')]
+        )
+        if not ckpt_files:
+            raise RuntimeError(f"目录 {args.checkpoint_dir} 下未找到 .pt 文件")
+    else:
+        if not args.checkpoint:
+            raise RuntimeError("请提供 --checkpoint 或使用 --all")
+        ckpt_files = [args.checkpoint]
+
+    for ckpt_path in ckpt_files:
+        _run_inference_for_checkpoint(ckpt_path, args)
 
 
 if __name__ == "__main__":

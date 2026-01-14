@@ -169,8 +169,8 @@ def physics_model(
 
     # Vds 有效系数改为温度的一次函数后取 sigmoid
     coef = torch.sigmoid(vds_coef_slope * T + vds_coef_intercept)
-    Vds_eff = Vds * coef
-
+    # Vds_eff = Vds * coef
+    Vds_eff = Vds * 1
     T_safe = torch.clamp(T, min=CFG.min_temperature)
 
     NET5_value = param3 * 1.0 / (param1 * (T_safe / 300.0) ** -0.01 + param6 * (T_safe / 300.0) ** param2)
@@ -249,7 +249,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
     if not isinstance(vgs_raw, torch.Tensor):
         vgs_raw = torch.tensor(vgs_raw, dtype=torch.float32, device=device)
 
-    # 输出：每个时间点的空间平均温度（避免对需要梯度的张量做原地写入）
+    # 输出：每个时间点的芯片最高温度（避免对需要梯度的张量做原地写入）
     # 这里用 list 累积，再 stack；可避免 autograd 的 inplace version mismatch。
     t_mean_list: List[torch.Tensor] = []
     physics_pred_list: List[torch.Tensor] = []
@@ -289,15 +289,15 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
     X, Y, Z = torch.meshgrid(x_mapped, y_mapped, z_mapped, indexing="ij")
     region_mask = ~((X > 0.8 * a) & (Y > 3.0 / 8.0 * b) & (Y < 5.0 / 8.0 * b))
 
-    # 只反馈 z=0 表面的平均温度（该平面温度最高）
-    prev_T_surface: Optional[torch.Tensor] = None
+    # 反馈：芯片全域的最大温度
+    prev_T_max: Optional[torch.Tensor] = None
     for i in range(len(time_raw)):
-        T_surface_prev = T_field[:, :, 0].mean() if prev_T_surface is None else prev_T_surface
+        T_prev = T_field.max() if prev_T_max is None else prev_T_max
 
         ids_prev = physics_model(
             vds_raw[i],
             vgs_raw[i],
-            T_surface_prev,
+            T_prev,
             model.param1,
             model.param2,
             model.param3,
@@ -369,7 +369,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
 
                 T_field = T_new
 
-        T_mean = T_field[:, :, 0].mean()
+        T_mean = T_field.max()
         ids_now = physics_model(
             vds_raw[i],
             vgs_raw[i],
@@ -389,7 +389,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
 
         t_mean_list.append(T_mean)
         physics_pred_list.append(ids_now)
-        prev_T_surface = T_mean
+        prev_T_max = T_mean
 
         if torch.isnan(ids_now):
             print(f"!!! NaN detected at step {i} !!!")
