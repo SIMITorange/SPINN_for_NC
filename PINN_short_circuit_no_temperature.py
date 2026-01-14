@@ -169,7 +169,7 @@ def physics_model(
 
     # Vds 有效系数改为温度的一次函数后取 sigmoid
     coef = torch.sigmoid(vds_coef_slope * T + vds_coef_intercept)
-    # Vds_eff = Vds * coef
+    # Vds_eff = Vds * coef #移除Vds的系数
     Vds_eff = Vds * 1
     T_safe = torch.clamp(T, min=CFG.min_temperature)
 
