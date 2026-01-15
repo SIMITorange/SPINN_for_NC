@@ -7,7 +7,8 @@
 用法示例：
   python scripts/plot_paper_figures.py --input results/<group_name>
   python scripts/plot_paper_figures.py --input inference/<ckpt_stem>
-
+  python scripts/plot_paper_figures.py --all --root results
+  python scripts/plot_paper_figures.py --all --root inference
 要求对应：
 - 绘图参数都集中在本文件顶部 CONFIG 区
 - 绘图数据本身不在这里生成：由训练/推理脚本以 txt 形式落盘
@@ -62,7 +63,7 @@ class PlotConfig:
     ylabel_loss: str = "Loss (log10)"
 
     # 输出
-    save_vector: bool = True  # True->pdf, False->png
+    save_vector: bool = False  # True->pdf, False->png
     dpi: int = 300
 
 
@@ -171,21 +172,44 @@ def plot_loss(input_dir: str) -> Optional[str]:
     return out_path
 
 
+def _has_fit_file(directory: str) -> bool:
+    fit_path = os.path.join(directory, "fit_time_ids_true_pred_physics_Tmean.txt")
+    infer_path = os.path.join(directory, "infer_time_ids_true_pred_physics_Tmean.txt")
+    return os.path.exists(fit_path) or os.path.exists(infer_path)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="results/<group> 或 inference/<ckpt_stem> 目录")
+    ap.add_argument("--input", help="单个目录：results/<group> 或 inference/<ckpt_stem>")
+    ap.add_argument("--all", action="store_true", help="遍历 root 下所有包含 fit/infer txt 的目录")
+    ap.add_argument("--root", default="results", help="--all 模式下的根目录（如 results 或 inference）")
     args = ap.parse_args()
 
     _apply_style()
 
-    ids_fig = plot_ids(args.input)
-    loss_fig = plot_loss(args.input)
-
-    print(f"Saved: {ids_fig}")
-    if loss_fig:
-        print(f"Saved: {loss_fig}")
+    targets = []
+    if args.all:
+        if not os.path.isdir(args.root):
+            raise RuntimeError(f"根目录不存在: {args.root}")
+        for name in sorted(os.listdir(args.root)):
+            candidate = os.path.join(args.root, name)
+            if os.path.isdir(candidate) and _has_fit_file(candidate):
+                targets.append(candidate)
+        if not targets:
+            raise RuntimeError(f"在 {args.root} 下未找到包含 fit/infer 数据的子目录")
     else:
-        print("No loss_curves.txt found; skipped loss figure.")
+        if not args.input:
+            raise RuntimeError("请提供 --input 或使用 --all")
+        targets = [args.input]
+
+    for tdir in targets:
+        ids_fig = plot_ids(tdir)
+        loss_fig = plot_loss(tdir)
+        print(f"Saved: {ids_fig}")
+        if loss_fig:
+            print(f"Saved: {loss_fig}")
+        else:
+            print(f"No loss_curves.txt found in {tdir}; skipped loss figure.")
 
 
 if __name__ == "__main__":

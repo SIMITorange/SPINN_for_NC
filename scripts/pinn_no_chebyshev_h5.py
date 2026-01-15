@@ -1,10 +1,16 @@
+"""PINN training with HDF5 groups, using a simple temperature integrator (no Chebyshev).
+
+Aside from the temperature integration, the surrounding pipeline matches
+PINN_short_circuit_no_temperature.py: same HDF5 loading, per-group training,
+logging, checkpointing, and TXT outputs for downstream plotting scripts.
+"""
 from __future__ import annotations
 
 import csv
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -14,15 +20,19 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
-import h5py  # type: ignore
+try:
+    import h5py  # type: ignore
+except ImportError:  # pragma: no cover
+    h5py = None
+
 
 @dataclass(frozen=True)
 class TrainConfig:
-    # 数据
+    # Data
     hdf5_path: str = "combined_training_data.h5"
-    output_dir: str = "results"
-    checkpoint_dir: str = "checkpoints"
-    # 训练
+    output_dir: str = "results_no_cheb"
+    checkpoint_dir: str = "checkpoints_no_cheb"
+    # Training
     num_epochs: int = 300
     # batch_size: int = 300 # Not used; full sequence batch
     alpha: float = 0.9
@@ -35,20 +45,11 @@ class TrainConfig:
     scheduler_patience: int = 20
     scheduler_factor: float = 0.5
     use_tensorboard: bool = True
-    tb_log_dir: str = "runs"
-    # 热传导（Chebyshev）
-    a: float = 1.5e-3
-    b: float = 1e-3
-    c: float = 10e-5
-    rho: float = 3200.0
-    Nx: int = 10
-    Ny: int = 10
-    Nz: int = 10
-    h_z0: float = 10 #顶部散热系数
-    h_zc: float = 5e4 #底部散热系数
-    T_inf: float = 300.0
-    # 数值稳定
-    max_substep_dt: float = 2e-9
+    tb_log_dir: str = "runs_no_cheb"
+    # Thermal (simple Euler model)
+    rho: float = 3200.0          # density proxy
+    c_th: float = 600.0          # specific heat proxy
+    ids_area: float = 20e-6      # area scaling used in legacy formula
     min_temperature: float = 1.0
 
 
@@ -60,7 +61,7 @@ def _ensure_dir(path: str) -> None:
 
 
 def _safe_filename(name: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
+    return "".join(ch if ch.isalnum() or ch in "-_ ." else "_" for ch in name)
 
 
 def _save_txt(path: str, array_2d: np.ndarray, header: str) -> None:
@@ -79,11 +80,7 @@ def _append_csv_row(csv_path: str, header: List[str], row: Dict[str, Any]) -> No
 
 
 def load_hdf5_groups(hdf5_path: str) -> List[Tuple[str, np.ndarray, Dict[str, Any]]]:
-    """返回 [(group_name, data_np, labels_dict)]
-
-    data_np 形状: (N, 4) 列顺序通常是 [time(s), Ids, Vds, Vgs]。
-    labels_dict 来自 group.attrs。
-    """
+    """Return [(group_name, data_np, labels_dict)] from HDF5."""
     if h5py is None:
         raise RuntimeError("缺少依赖 h5py：请先安装 `pip install h5py` 后再运行。")
 
@@ -131,14 +128,9 @@ class PINN(nn.Module):
         self.param8 = nn.Parameter(torch.tensor(5.0, dtype=torch.float32))
         self.param9 = nn.Parameter(torch.tensor(-0.5, dtype=torch.float32))
 
-        # 热相关参数（epi_thickness 固定为常数，不参与训练）
-        self.register_buffer("epi_thickness", torch.tensor(1.0e-5, dtype=torch.float32))
-        # self.epi_thickness = nn.Parameter(torch.tensor(1.0e-5, dtype=torch.float32))
+        # Thermal parameters (match sample script)
+        self.epi_thickness = nn.Parameter(torch.tensor(1.0e-5, dtype=torch.float32))
         self.T_initial = nn.Parameter(torch.tensor(350.0, dtype=torch.float32))
-
-        # 修改4：Vds 系数（一次函数经 sigmoid 约束到 0~1）
-        self.vds_coef_slope = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.vds_coef_intercept = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -157,8 +149,6 @@ def physics_model(
     param7: torch.Tensor,
     param8: torch.Tensor,
     param9: torch.Tensor,
-    vds_coef_slope: torch.Tensor,
-    vds_coef_intercept: torch.Tensor,
 ) -> torch.Tensor:
     if not isinstance(Vds, torch.Tensor):
         Vds = torch.tensor(Vds, dtype=torch.float32)
@@ -167,252 +157,90 @@ def physics_model(
     if not isinstance(T, torch.Tensor):
         T = torch.tensor(T, dtype=torch.float32)
 
-    # Vds 有效系数改为温度的一次函数后取 sigmoid
-    coef = torch.sigmoid(vds_coef_slope * T + vds_coef_intercept)
-    # Vds_eff = Vds * coef #移除Vds的系数
-    Vds_eff = Vds * 1
-    T_safe = torch.clamp(T, min=CFG.min_temperature)
-
-    NET5_value = param3 * 1.0 / (param1 * (T_safe / 300.0) ** -param7 + param6 * (T_safe / 300.0) ** param2)
-    NET3_value = -0.004263 * T_safe + 3.422579
+    net5 = param3 * 1.0 / (param1 * (T / 300.0) ** -param7 + param6 * (T / 300.0) ** param2)
+    net3 = -0.004263 * T + 3.422579
     p9 = param5
-    NET2_value = -0.005 * Vgs + 0.165
-    NET1_value = -0.1717 * Vgs + 3.5755
-    term3 = (torch.log(1 + torch.exp(Vgs - NET3_value))) ** 2 - (
-        torch.log(
-            1
-            + torch.exp(
-                Vgs
-                - NET3_value
-                - (NET2_value * Vds_eff * ((1 + torch.exp(p9 * Vds_eff)) ** NET1_value))
-            )
-        )
-        ** 2
-    )
-    term1 = NET5_value * (Vgs - NET3_value)
-    term2 = 1 + 0.0005 * Vds_eff
+    net2 = -0.005 * Vgs + 0.165
+    net1 = -0.1717 * Vgs + 3.5755
+    term3 = (torch.log(1 + torch.exp(Vgs - net3))) ** 2 - (
+        torch.log(1 + torch.exp(Vgs - net3 - (net2 * Vds * ((1 + torch.exp(p9 * Vds)) ** net1))))
+    ) ** 2
+    term1 = net5 * (Vgs - net3)
+    term2 = 1 + 0.0005 * Vds
     return term2 * term1 * term3
 
 
-_CHEB_CACHE: Dict[Tuple[int, int], torch.Tensor] = {}
-
-
-def _chebyshev_diff_matrix_torch(N: int, order: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """torch 版本的 Chebyshev 一/二阶微分矩阵（与 chebeshev.py 一致的构造）。"""
-    key = (N, order)
-    cache_key = (key[0] * 10 + key[1], id(device))
-    # 简单 device 级别缓存（避免反复构建）
-    if cache_key in _CHEB_CACHE:
-        return _CHEB_CACHE[cache_key].to(device=device, dtype=dtype)
-
-    if order == 1:
-        x = torch.cos(torch.pi * torch.arange(N, device=device, dtype=dtype) / (N - 1))
-        c = torch.ones(N, device=device, dtype=dtype)
-        c[0] = 2.0
-        c[-1] = 2.0
-
-        ii = torch.arange(N, device=device)
-        I, J = torch.meshgrid(ii, ii, indexing="ij")
-        D = torch.zeros((N, N), device=device, dtype=dtype)
-        mask = I != J
-
-        sign = torch.where(((I + J) % 2) == 0, 1.0, -1.0).to(dtype)
-        D[mask] = (c[I[mask]] / c[J[mask]]) * sign[mask] / (x[I[mask]] - x[J[mask]])
-        D.fill_diagonal_(0.0)
-        D.diagonal().copy_(-D.sum(dim=1))
-
-        _CHEB_CACHE[cache_key] = D.detach().cpu()
-        return D
-
-    if order == 2:
-        D1 = _chebyshev_diff_matrix_torch(N, 1, device=device, dtype=dtype)
-        D2 = D1 @ D1
-        _CHEB_CACHE[cache_key] = D2.detach().cpu()
-        return D2
-
-    raise ValueError("只支持一阶和二阶导数")
-
-
-def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
-    """温度积分计算函数（保持原始接口不变）。
-
-    替换为 chebeshev.py 的热传导逻辑（Chebyshev 伪谱 + 显式步进）。
-    这里返回的 T 为“温度分布的Tmax序列”，从而保持与原脚本兼容。
-    """
-    device = time_raw.device if isinstance(time_raw, torch.Tensor) else torch.device("cpu")
-    dtype = time_raw.dtype if isinstance(time_raw, torch.Tensor) else torch.float32
-
+def integrate_temperature(
+    time_raw: torch.Tensor,
+    vds_raw: torch.Tensor,
+    vgs_raw: torch.Tensor,
+    model: PINN,
+    cfg: TrainConfig,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Simple Euler temperature update (no spectral solver)."""
     if not isinstance(time_raw, torch.Tensor):
-        time_raw = torch.tensor(time_raw, dtype=torch.float32, device=device)
+        time_raw = torch.tensor(time_raw, dtype=torch.float32)
     if not isinstance(vds_raw, torch.Tensor):
-        vds_raw = torch.tensor(vds_raw, dtype=torch.float32, device=device)
+        vds_raw = torch.tensor(vds_raw, dtype=torch.float32)
     if not isinstance(vgs_raw, torch.Tensor):
-        vgs_raw = torch.tensor(vgs_raw, dtype=torch.float32, device=device)
+        vgs_raw = torch.tensor(vgs_raw, dtype=torch.float32)
 
-    # 输出：每个时间点的芯片最高温度（避免对需要梯度的张量做原地写入）
-    # 这里用 list 累积，再 stack；可避免 autograd 的 inplace version mismatch。
-    t_mean_list: List[torch.Tensor] = []
-    physics_pred_list: List[torch.Tensor] = []
+    device = time_raw.device
+    dtype = time_raw.dtype
 
-    delta_time = torch.zeros_like(time_raw, dtype=torch.float32)
+    delta_time = torch.zeros_like(time_raw, dtype=dtype, device=device)
     delta_time[1:] = time_raw[1:] - time_raw[:-1]
 
-    # 几何/网格
-    a, b, c = CFG.a, CFG.b, CFG.c
-    Nx, Ny, Nz = CFG.Nx, CFG.Ny, CFG.Nz
+    rho_cp = cfg.rho * cfg.c_th
+    ids_area = cfg.ids_area
 
-    x = -torch.cos(torch.pi * torch.arange(Nx, device=device, dtype=dtype) / (Nx - 1))
-    y = -torch.cos(torch.pi * torch.arange(Ny, device=device, dtype=dtype) / (Ny - 1))
-    z = -torch.cos(torch.pi * torch.arange(Nz, device=device, dtype=dtype) / (Nz - 1))
-    x_mapped = a * (x + 1) / 2
-    y_mapped = b * (y + 1) / 2
-    z_mapped = c * (z + 1) / 2
-    dz0 = (z_mapped[1] - z_mapped[0]).abs()
-    dzc = (z_mapped[-1] - z_mapped[-2]).abs()
+    T_list: List[torch.Tensor] = []
+    physics_list: List[torch.Tensor] = []
 
-    Dx = (2.0 / a) * _chebyshev_diff_matrix_torch(Nx, 1, device=device, dtype=dtype)
-    Dy = (2.0 / b) * _chebyshev_diff_matrix_torch(Ny, 1, device=device, dtype=dtype)
-    Dz = (2.0 / c) * _chebyshev_diff_matrix_torch(Nz, 1, device=device, dtype=dtype)
-    Dxx = (2.0 / a) ** 2 * _chebyshev_diff_matrix_torch(Nx, 2, device=device, dtype=dtype)
-    Dyy = (2.0 / b) ** 2 * _chebyshev_diff_matrix_torch(Ny, 2, device=device, dtype=dtype)
-    Dzz = (2.0 / c) ** 2 * _chebyshev_diff_matrix_torch(Nz, 2, device=device, dtype=dtype)
-
-    # 初始温度场（保持对 T_initial 的梯度）
-    T_field = torch.ones((Nx, Ny, Nz), device=device, dtype=torch.float32) * model.T_initial
-
-    epi_thickness = model.epi_thickness
-    h_z0 = CFG.h_z0
-    h_zc = CFG.h_zc
-    T_inf = CFG.T_inf
-    rho = CFG.rho
-
-    X, Y, Z = torch.meshgrid(x_mapped, y_mapped, z_mapped, indexing="ij")
-    region_mask = ~((X > 0.8 * a) & (Y > 3.0 / 8.0 * b) & (Y < 5.0 / 8.0 * b))
-
-    # 反馈：芯片全域的最大温度
-    prev_T_max: Optional[torch.Tensor] = None
+    prev_T = model.T_initial
     for i in range(len(time_raw)):
-        T_prev = T_field.max() if prev_T_max is None else prev_T_max
+        if i > 0:
+            ids_prev = physics_model(
+                vds_raw[i],
+                vgs_raw[i],
+                prev_T.detach(),
+                model.param1,
+                model.param2,
+                model.param3,
+                model.param4,
+                model.param5,
+                model.param6,
+                model.param7,
+                model.param8,
+                model.param9,
+            )
+            delta_T = (2.0 * vds_raw[i] / 1e-5) * (ids_prev / ids_area) * delta_time[i] / rho_cp
+            current_T = prev_T + delta_T
+        else:
+            current_T = model.T_initial
 
-        ids_prev = physics_model(
-            vds_raw[i],
-            vgs_raw[i],
-            T_prev,
-            model.param1,
-            model.param2,
-            model.param3,
-            model.param4,
-            model.param5,
-            model.param6,
-            model.param7,
-            model.param8,
-            model.param9,
-            model.vds_coef_slope,
-            model.vds_coef_intercept,
+        T_list.append(current_T)
+        physics_list.append(
+            physics_model(
+                vds_raw[i],
+                vgs_raw[i],
+                current_T,
+                model.param1,
+                model.param2,
+                model.param3,
+                model.param4,
+                model.param5,
+                model.param6,
+                model.param7,
+                model.param8,
+                model.param9,
+            )
         )
+        prev_T = current_T
 
-        dt_i = float(delta_time[i].detach().cpu().item()) if i > 0 else 0.0
-        if dt_i > 0:
-            n_sub = max(1, int(np.ceil(dt_i / CFG.max_substep_dt)))
-            sub_dt = dt_i / n_sub
-
-            # z 分布：z<=epi_thickness 时线性衰减
-            z_prof = torch.where(Z <= epi_thickness, 1.0 - Z / torch.clamp(epi_thickness, min=1e-12), 0.0)
-            base_value = ids_prev * (2.0 * vds_raw[i]) / (a * b * c)
-            P = base_value * z_prof * region_mask.to(z_prof.dtype)
-
-            for _ in range(n_sub):
-                T_safe = torch.clamp(T_field, min=CFG.min_temperature)
-
-                denom_k = torch.clamp(-0.0003 + 1.05e-5 * T_safe, min=1e-12)
-                k = 1.0 / denom_k
-                C = 300.0 * (5.13 - 1001.0 / T_safe + 3.23e4 / (T_safe**2))
-                C = torch.clamp(C, min=1e-12)
-
-                d2T_dx2 = torch.einsum("im,mjk->ijk", Dxx, T_field)
-                d2T_dy2 = torch.einsum("jm,imk->ijk", Dyy, T_field)
-                d2T_dz2 = torch.einsum("km,ijm->ijk", Dzz, T_field)
-                laplacian_T = d2T_dx2 + d2T_dy2 + d2T_dz2
-
-                dk_dx = torch.einsum("im,mjk->ijk", Dx, k)
-                dT_dx = torch.einsum("im,mjk->ijk", Dx, T_field)
-                dk_dy = torch.einsum("jm,imk->ijk", Dy, k)
-                dT_dy = torch.einsum("jm,imk->ijk", Dy, T_field)
-                dk_dz = torch.einsum("km,ijm->ijk", Dz, k)
-                dT_dz = torch.einsum("km,ijm->ijk", Dz, T_field)
-                grad_k_dot_grad_T = dk_dx * dT_dx + dk_dy * dT_dy + dk_dz * dT_dz
-
-                rhs = k * laplacian_T + grad_k_dot_grad_T + P
-                T_new = T_field + (sub_dt / (rho * C)) * rhs
-
-                # 边界条件：x/y 绝热
-                T_new[0, :, :] = T_new[1, :, :]
-                T_new[-1, :, :] = T_new[-2, :, :]
-                T_new[:, 0, :] = T_new[:, 1, :]
-                T_new[:, -1, :] = T_new[:, -2, :]
-
-                # z=0
-                if h_z0 > 0:
-                    k_surf = torch.clamp(k[:, :, 0], min=1e-12)
-                    beta = (h_z0 * dz0) / k_surf
-                    T_new[:, :, 0] = (T_new[:, :, 1] + beta * T_inf) / (1.0 + beta)
-                else:
-                    T_new[:, :, 0] = T_new[:, :, 1]
-
-                # z=c
-                if h_zc > 0:
-                    k_surf = torch.clamp(k[:, :, -1], min=1e-12)
-                    beta = (h_zc * dzc) / k_surf
-                    T_new[:, :, -1] = (T_new[:, :, -2] + beta * T_inf) / (1.0 + beta)
-                else:
-                    T_new[:, :, -1] = T_new[:, :, -2]
-
-                T_field = T_new
-
-        T_mean = T_field.max()
-        ids_now = physics_model(
-            vds_raw[i],
-            vgs_raw[i],
-            T_mean,
-            model.param1,
-            model.param2,
-            model.param3,
-            model.param4,
-            model.param5,
-            model.param6,
-            model.param7,
-            model.param8,
-            model.param9,
-            model.vds_coef_slope,
-            model.vds_coef_intercept,
-        )
-
-        t_mean_list.append(T_mean)
-        physics_pred_list.append(ids_now)
-        prev_T_max = T_mean
-
-        if torch.isnan(ids_now):
-            print(f"!!! NaN detected at step {i} !!!")
-            print(f"T_mean={T_mean.item()}, Vds={float(vds_raw[i])}, Vgs={float(vgs_raw[i])}")
-            break
-
-    # 保持与原接口一致：返回形状与 time_raw 相同的一维序列
-    if len(t_mean_list) == 0:
-        # 极端兜底：避免空 stack
-        T_mean_seq = torch.ones_like(time_raw, dtype=torch.float32) * model.T_initial
-        physics_preds = torch.zeros_like(vds_raw, dtype=torch.float32)
-        return T_mean_seq, physics_preds
-
-    T_mean_seq = torch.stack(t_mean_list).to(dtype=torch.float32)
-    physics_preds = torch.stack(physics_pred_list).to(dtype=torch.float32)
-
-    # 若输入不是 1D（理论上不该发生），做 reshape 以匹配输入
-    if T_mean_seq.shape != time_raw.shape:
-        T_mean_seq = T_mean_seq.reshape(time_raw.shape)
-    if physics_preds.shape != vds_raw.shape:
-        physics_preds = physics_preds.reshape(vds_raw.shape)
-
-    return T_mean_seq, physics_preds
+    T_seq = torch.stack(T_list)
+    physics_preds = torch.stack(physics_list)
+    return T_seq, physics_preds
 
 
 def train_one_group(
@@ -421,7 +249,6 @@ def train_one_group(
     labels: Dict[str, Any],
     cfg: TrainConfig,
 ) -> Dict[str, Any]:
-    """单组训练：返回可学习参数汇总 dict（用于最终CSV）。"""
     # data: [time(s), Ids, Vds, Vgs]
     time_col = data_np[:, 0:1]
     ids_col = data_np[:, 1:2]
@@ -465,9 +292,8 @@ def train_one_group(
                     model.param7,
                     model.param8,
                     model.param9,
+                    model.epi_thickness,
                     model.T_initial,
-                    model.vds_coef_slope,
-                    model.vds_coef_intercept,
                 ],
                 "lr": cfg.lr_params,
             },
@@ -500,7 +326,7 @@ def train_one_group(
             vds_raw = X_batch[:, 1] * input_std[1] + input_mean[1]
             vgs_raw = X_batch[:, 2] * input_std[2] + input_mean[2]
 
-            T_mean, physics_preds = integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model)
+            T_mean, physics_preds = integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg)
 
             physics_pred_scaled = (physics_preds - target_mean) / target_std
             loss_physics = mse_loss(pred.squeeze(), physics_pred_scaled)
@@ -547,7 +373,7 @@ def train_one_group(
                 f"LR: {lr_metrics[-1]:.2e}"
             )
 
-    # 训练后：生成全量序列用于保存（保持原始数据）
+    # Full evaluation
     model.eval()
     with torch.no_grad():
         X_full = torch.tensor(X_scaled, dtype=torch.float32)
@@ -557,14 +383,12 @@ def train_one_group(
         time_raw = X_full[:, 0] * input_std[0] + input_mean[0]
         vds_raw = X_full[:, 1] * input_std[1] + input_mean[1]
         vgs_raw = X_full[:, 2] * input_std[2] + input_mean[2]
-        T_mean, ids_physics = integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model)
+        T_mean, ids_physics = integrate_temperature(time_raw, vds_raw, vgs_raw, model, cfg)
 
     if writer is not None:
         param_keys = [f"param{i}" for i in range(1, 10)] + [
             "epi_thickness",
             "T_initial",
-            "vds_coef_slope",
-            "vds_coef_intercept",
         ]
         for pk in param_keys:
             if hasattr(model, pk):
@@ -573,7 +397,7 @@ def train_one_group(
         writer.flush()
         writer.close()
 
-    # 保存 txt（所有绘图数据保持原始单位）
+    # Save txt outputs
     group_dir = os.path.join(cfg.output_dir, _safe_filename(group_name))
     _ensure_dir(group_dir)
 
@@ -616,7 +440,7 @@ def train_one_group(
         header="epoch total_loss data_loss physics_loss w_data w_physics lr",
     )
 
-    # 保存 checkpoint
+    # Save checkpoint
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     ckpt_name = _safe_filename(
         f"{group_name}_Vds{labels.get('vds_max','')}_Vgs{labels.get('vgs_max','')}_{timestamp}.pt"
@@ -656,8 +480,6 @@ def train_one_group(
         "param9": float(model.param9.detach().cpu().item()),
         "epi_thickness": float(model.epi_thickness.detach().cpu().item()),
         "T_initial": float(model.T_initial.detach().cpu().item()),
-        "vds_coef_slope": float(model.vds_coef_slope.detach().cpu().item()),
-        "vds_coef_intercept": float(model.vds_coef_intercept.detach().cpu().item()),
     }
     return learned
 
@@ -689,8 +511,6 @@ def main() -> None:
         "param9",
         "epi_thickness",
         "T_initial",
-        "vds_coef_slope",
-        "vds_coef_intercept",
     ]
 
     for group_name, data_np, labels in groups:
@@ -704,4 +524,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
