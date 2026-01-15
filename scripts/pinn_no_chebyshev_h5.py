@@ -177,7 +177,7 @@ def integrate_temperature(
     model: PINN,
     cfg: TrainConfig,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Simple Euler temperature update (no spectral solver)."""
+    """Simple Euler temperature update (match reference temperature logic)."""
     if not isinstance(time_raw, torch.Tensor):
         time_raw = torch.tensor(time_raw, dtype=torch.float32)
     if not isinstance(vds_raw, torch.Tensor):
@@ -191,19 +191,15 @@ def integrate_temperature(
     delta_time = torch.zeros_like(time_raw, dtype=dtype, device=device)
     delta_time[1:] = time_raw[1:] - time_raw[:-1]
 
-    rho_cp = cfg.rho * cfg.c_th
-    ids_area = cfg.ids_area
-
-    T_list: List[torch.Tensor] = []
+    T_list: List[torch.Tensor] = [model.T_initial.clone().requires_grad_(True)]
     physics_list: List[torch.Tensor] = []
 
-    prev_T = model.T_initial
     for i in range(len(time_raw)):
         if i > 0:
             ids_prev = physics_model(
                 vds_raw[i],
                 vgs_raw[i],
-                prev_T.detach(),
+                T_list[i - 1].detach(),
                 model.param1,
                 model.param2,
                 model.param3,
@@ -214,17 +210,25 @@ def integrate_temperature(
                 model.param8,
                 model.param9,
             )
-            delta_T = (2.0 * vds_raw[i] / 1e-5) * (ids_prev / ids_area) * delta_time[i] / rho_cp
-            current_T = prev_T + delta_T
+            denom_c = 300.0 * (5.13 - 1001.0 / T_list[i - 1] + (3.23e4) / (T_list[i - 1] ** 2))
+            delta_T = (
+                2.0
+                * vds_raw[i]
+                / 1e-5
+                * (ids_prev / 20e-6)
+                * delta_time[i]
+                / (denom_c * cfg.rho)
+            )
+            current_T = T_list[i - 1] + delta_T
         else:
-            current_T = model.T_initial
+            current_T = T_list[0].clone()
 
         T_list.append(current_T)
         physics_list.append(
             physics_model(
                 vds_raw[i],
                 vgs_raw[i],
-                current_T,
+                T_list[i],
                 model.param1,
                 model.param2,
                 model.param3,
@@ -236,9 +240,8 @@ def integrate_temperature(
                 model.param9,
             )
         )
-        prev_T = current_T
 
-    T_seq = torch.stack(T_list)
+    T_seq = torch.stack(T_list[1:])
     physics_preds = torch.stack(physics_list)
     return T_seq, physics_preds
 
