@@ -23,7 +23,7 @@ class TrainConfig:
     output_dir: str = "results"
     checkpoint_dir: str = "checkpoints"
     # 训练
-    num_epochs: int = 150
+    num_epochs: int = 300
     batch_size: int = 300
     alpha: float = 0.9
     init_w_data: float = 0.5
@@ -44,8 +44,8 @@ class TrainConfig:
     Nx: int = 10
     Ny: int = 10
     Nz: int = 10
-    h_z0: float = 5e4
-    h_zc: float = 0.0
+    h_z0: float = 10 #顶部散热系数
+    h_zc: float = 5e4 #底部散热系数
     T_inf: float = 300.0
     # 数值稳定
     max_substep_dt: float = 2e-9
@@ -237,7 +237,7 @@ def integrate_temperature(time_raw, vds_raw, vgs_raw, model, physics_model):
     """温度积分计算函数（保持原始接口不变）。
 
     替换为 chebeshev.py 的热传导逻辑（Chebyshev 伪谱 + 显式步进）。
-    这里返回的 T 为“温度分布的空间平均值序列”，从而保持与原脚本兼容。
+    这里返回的 T 为“温度分布的Tmax序列”，从而保持与原脚本兼容。
     """
     device = time_raw.device if isinstance(time_raw, torch.Tensor) else torch.device("cpu")
     dtype = time_raw.dtype if isinstance(time_raw, torch.Tensor) else torch.float32
