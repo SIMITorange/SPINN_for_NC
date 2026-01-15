@@ -23,7 +23,7 @@ class TrainConfig:
     output_dir: str = "results"
     checkpoint_dir: str = "checkpoints"
     # 训练
-    num_epochs: int = 300
+    num_epochs: int = 500
     # batch_size: int = 300 # Not used; full sequence batch
     alpha: float = 0.9
     init_w_data: float = 0.5
@@ -540,7 +540,7 @@ def train_one_group(
             writer.add_scalar("Learning_Rate", lr_metrics[-1], epoch)
             writer.add_scalars("Weights", {"w_data": w_data, "w_physics": w_physics}, epoch)
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 50 == 0:
             print(
                 f"[{group_name}] Epoch {epoch + 1:04d} | Loss: {losses[-1]:.3e} | "
                 f"Data: {data_metrics[-1]:.2e} | Physics: {physics_metrics[-1]:.2e} | "
