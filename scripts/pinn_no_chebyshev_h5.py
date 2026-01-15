@@ -48,7 +48,8 @@ class TrainConfig:
     tb_log_dir: str = "runs_no_cheb"
     # Thermal (simple Euler model)
     rho: float = 3200.0          # density proxy
-    c_th: float = 600.0          # specific heat proxy
+    # c_th: float = 600.0          # specific heat proxy, not used directly
+    # c_th is Temp dependent denom_c = 300.0 * (5.13 - 1001.0 / T_list[i - 1] + (3.23e4) / (T_list[i - 1] ** 2))
     ids_area: float = 20e-6      # area scaling used in legacy formula
     min_temperature: float = 1.0
 
