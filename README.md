@@ -1,5 +1,74 @@
 # SPINN for NC / 短路PINN工程
 
+## English Guide
+
+### Overview
+This project builds a Physics-Informed Neural Network (PINN) for short-circuit behavior. It fuses an electrical physics model with temperature feedback (Chebyshev heat conduction or a simplified thermal model) and exports TXT files for paper-quality plots.
+
+Core pipeline:
+- Data: clean/decimate CSV → aggregate into grouped HDF5.
+- Training: inputs (time, Vds, Vgs) → target Ids, plus physics loss with temperature feedback.
+- Inference & plotting: load checkpoints/TXT and generate figures.
+
+### Quick Start
+1) Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+2) Data preprocessing (CSV → HDF5)
+```bash
+python data_process_v0.py
+```
+Select a folder containing CSV files; it generates combined_training_data.h5.
+
+3) Train (with Chebyshev thermal solver)
+```bash
+python PINN_short_circuit_no_temperature.py
+```
+
+4) Train (no Chebyshev, simplified thermal model)
+```bash
+python scripts/pinn_no_chebyshev_h5.py
+```
+
+5) Inference from checkpoint
+```bash
+python scripts/infer_from_checkpoint.py --checkpoint checkpoints/xxx.pt
+```
+Batch mode:
+```bash
+python scripts/infer_from_checkpoint.py --all --checkpoint-dir checkpoints
+```
+
+6) Plot paper-style figures
+```bash
+python scripts/plot_paper_figures.py --input results/<group_name>
+```
+Batch mode:
+```bash
+python scripts/plot_paper_figures.py --all --root results
+```
+
+### Script Guide
+- PINN_short_circuit_no_temperature.py: main training (HDF5 groups + Chebyshev thermal solver).
+- data_process_v0.py: CSV cleaning/decimation and HDF5 aggregation.
+- chebeshev.py: standalone Chebyshev heat-conduction demo.
+- scripts/pinn_no_chebyshev_h5.py: HDF5 training with simplified thermal model.
+- scripts/pinn_no_chebyshev.py: Excel-based legacy/single-file training flow.
+- scripts/infer_from_checkpoint.py: inference for Chebyshev checkpoints.
+- scripts/infer_no_chebyshev.py: inference for no-Chebyshev checkpoints.
+- scripts/plot_paper_figures.py: reads TXT outputs to generate figures.
+
+### Folder Guide
+- checkpoints/: checkpoints from Chebyshev training.
+- checkpoints_no_cheb/: checkpoints from no-Chebyshev training.
+- results/: training outputs (TXT/loss curves) with Chebyshev.
+- results_no_cheb/: outputs from no-Chebyshev runs.
+- runs/: TensorBoard logs (Chebyshev).
+- runs_no_cheb/: TensorBoard logs (no Chebyshev).
+- scripts/: inference and plotting utilities.
+
 ## 中文说明
 
 ### 项目简介
@@ -71,71 +140,3 @@ python scripts/plot_paper_figures.py --all --root results
 
 ---
 
-## English Guide
-
-### Overview
-This project builds a Physics-Informed Neural Network (PINN) for short-circuit behavior. It fuses an electrical physics model with temperature feedback (Chebyshev heat conduction or a simplified thermal model) and exports TXT files for paper-quality plots.
-
-Core pipeline:
-- Data: clean/decimate CSV → aggregate into grouped HDF5.
-- Training: inputs (time, Vds, Vgs) → target Ids, plus physics loss with temperature feedback.
-- Inference & plotting: load checkpoints/TXT and generate figures.
-
-### Quick Start
-1) Install dependencies
-```bash
-pip install -r requirements.txt
-```
-
-2) Data preprocessing (CSV → HDF5)
-```bash
-python data_process_v0.py
-```
-Select a folder containing CSV files; it generates combined_training_data.h5.
-
-3) Train (with Chebyshev thermal solver)
-```bash
-python PINN_short_circuit_no_temperature.py
-```
-
-4) Train (no Chebyshev, simplified thermal model)
-```bash
-python scripts/pinn_no_chebyshev_h5.py
-```
-
-5) Inference from checkpoint
-```bash
-python scripts/infer_from_checkpoint.py --checkpoint checkpoints/xxx.pt
-```
-Batch mode:
-```bash
-python scripts/infer_from_checkpoint.py --all --checkpoint-dir checkpoints
-```
-
-6) Plot paper-style figures
-```bash
-python scripts/plot_paper_figures.py --input results/<group_name>
-```
-Batch mode:
-```bash
-python scripts/plot_paper_figures.py --all --root results
-```
-
-### Script Guide
-- PINN_short_circuit_no_temperature.py: main training (HDF5 groups + Chebyshev thermal solver).
-- data_process_v0.py: CSV cleaning/decimation and HDF5 aggregation.
-- chebeshev.py: standalone Chebyshev heat-conduction demo.
-- scripts/pinn_no_chebyshev_h5.py: HDF5 training with simplified thermal model.
-- scripts/pinn_no_chebyshev.py: Excel-based legacy/single-file training flow.
-- scripts/infer_from_checkpoint.py: inference for Chebyshev checkpoints.
-- scripts/infer_no_chebyshev.py: inference for no-Chebyshev checkpoints.
-- scripts/plot_paper_figures.py: reads TXT outputs to generate figures.
-
-### Folder Guide
-- checkpoints/: checkpoints from Chebyshev training.
-- checkpoints_no_cheb/: checkpoints from no-Chebyshev training.
-- results/: training outputs (TXT/loss curves) with Chebyshev.
-- results_no_cheb/: outputs from no-Chebyshev runs.
-- runs/: TensorBoard logs (Chebyshev).
-- runs_no_cheb/: TensorBoard logs (no Chebyshev).
-- scripts/: inference and plotting utilities.
